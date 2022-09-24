@@ -25,7 +25,8 @@ type AllowedMethods =
 
 export interface UpChunkOptions {
   endpoint: string | ((file?: File) => Promise<string>);
-  file: File;
+  file?: File;
+  mediaRecorder?: MediaRecorder;
   method?: AllowedMethods;
   headers?: XhrHeaders;
   maxFileSize?: number;
@@ -38,9 +39,148 @@ export interface UpChunkOptions {
   minChunkSize?: number;
 }
 
-export class UpChunk  {
+type UpChunkTransformStreamConfig = {
+  chunkByteSize: number;
+}
+class UpChunkTransformStream {
+  private storage: Blob[] = []
+  private chunkByteSize: number;
+
+  constructor(config: UpChunkTransformStreamConfig) {
+    this.chunkByteSize = config.chunkByteSize;
+  }
+
+  start(controller: TransformStreamDefaultController) {
+    console.log('starting transformer')
+    console.log(`we are looking to make chunks of ${this.chunkByteSize} = this.chunkByteSize`)
+  }
+
+  transform(chunk: Blob | Uint8Array, controller: TransformStreamDefaultController) {
+    const incomingChunk = chunk instanceof Uint8Array ?
+      new Blob([chunk], { type: 'application/octet-stream' }) :
+      chunk;
+
+    let rangeStart = 0;
+    let rangeEnd = this.chunkByteSize - (this.storage[0]?.size || 0)
+    let remainingBytes = incomingChunk.size;
+
+    while (remainingBytes > 0) {
+      // if previous chunk has room for us, join this chunk and the prev chunk together.
+      const partial = incomingChunk.slice(rangeStart, rangeEnd);
+
+      const assembledChunk = new Blob([...this.storage, partial], {
+        type: 'application/octet-stream',
+      });
+
+      // debugger;
+
+      remainingBytes = remainingBytes - partial.size
+      rangeStart = incomingChunk.size - remainingBytes;
+      const offset = rangeStart + this.chunkByteSize - 1
+      rangeEnd = offset < incomingChunk.size ? offset : incomingChunk.size;
+
+      // debugger;
+
+      if (assembledChunk.size === this.chunkByteSize) {
+        // debugger;
+        controller.enqueue(assembledChunk);
+        this.storage = [];
+        // todo: get next optimal dynamic chunk size?
+      } else {
+        // debugger;
+        this.storage = [assembledChunk]
+      }
+    }
+  }
+
+  flush(controller: TransformStreamDefaultController) {
+    // Clean up and enqueue any chunks we’re still holding on to
+    console.log('flushing....');
+    if (this.storage[0]?.size > 0) {
+      controller.enqueue(this.storage[0]);
+    }
+  }
+}
+
+type UpChunkWritableStreamConfig = {
+  endpoint: string;
+  headers: XhrHeaders;
+  dispatch: (eventName: EventName, detail?: any) => void
+}
+
+class UpChunkWritableStream {
+  private headers;
+  private endpoint;
+  private dispatch;
+  private attemptCount: number;
+  private nextChunkRangeStart: number;
+  private lastChunkStart: Date;
+
+  protected async sendChunk(chunk: Blob) {
+    const rangeStart = this.nextChunkRangeStart;
+    const rangeEnd = rangeStart + chunk.size - 1;
+    const contentType = this.file?.type || this.mediaRecorder.mimeType
+    const rangeTotal = this.file?.size || '*';
+
+    const headers = {
+      ...this.headers,
+      'Content-Type': contentType,
+      'Content-Range': `bytes ${rangeStart}-${rangeEnd}/${rangeTotal}`,
+    };
+
+    this.dispatch('attempt', {
+      chunkNumber: this.chunkCount,
+      totalChunks: this.totalChunks,
+      chunkSize: this.chunkSize,
+    });
+
+    return this.xhrPromise({
+      headers,
+      url: this.endpointValue,
+      method: this.method,
+      body: this.chunk,
+    });
+  }
+
+  constructor(config: UpChunkWritableStreamConfig) {
+    this.headers = config.headers
+    this.endpoint = config.endpoint
+    this.dispatch = config.dispatch
+  }
+
+  start(controller: WritableStreamDefaultController) {
+    console.log('starting writable stream')
+    this.attemptCount = 0
+    this.nextChunkRangeStart = 0
+
+    controller.signal
+  }
+
+  write(chunk: Blob, controller: WritableStreamDefaultController) {
+    // if (this.paused || this.offline || this.success) {
+    //   return;
+    // }
+    console.log('writing')
+    this.attemptCount += 1;
+    this.lastChunkStart = new Date();
+    console.log(chunk);
+    // this.dispatch('success');
+    // this.sendChunk(chunk).then((res) => {})
+  }
+
+  close() {
+    console.log('closing writeble stream')
+  }
+
+  abort(reason: string) {
+    console.log('aborting writeble stream')
+    console.log(reason)
+  }
+}
+
+export class UpChunk {
   public endpoint: string | ((file?: File) => Promise<string>);
-  public file: File;
+  public file: File | undefined;
   public headers: XhrHeaders;
   public method: AllowedMethods;
   public chunkSize: number;
@@ -66,7 +206,11 @@ export class UpChunk  {
   private minChunkSize: number;
 
   private reader: FileReader;
-  private eventTarget: EventTarget<Record<EventName,UpchunkEvent>>;
+  private readableStream: ReadableStream;
+  private writableStream: WritableStream;
+  private transformStream: TransformStream;
+  private mediaRecorder: MediaRecorder | undefined;
+  private eventTarget: EventTarget<Record<EventName, UpchunkEvent>>;
 
 
 
@@ -84,7 +228,7 @@ export class UpChunk  {
     this.maxFileBytes = (options.maxFileSize || 0) * 1024;
     this.chunkCount = 0;
     this.chunkByteSize = this.chunkSize * 1024;
-    this.totalChunks = Math.ceil(this.file.size / this.chunkByteSize);
+    this.totalChunks = this.file ? Math.ceil(this.file.size / this.chunkByteSize) : Infinity;
     this.attemptCount = 0;
     this.offline = false;
     this.paused = false;
@@ -92,16 +236,54 @@ export class UpChunk  {
     this.nextChunkRangeStart = 0;
     this.maxChunkSize = options.maxChunkSize || 512000; // in kB
     this.minChunkSize = options.minChunkSize || 256; // in kB
-
-    this.reader = new FileReader();
+    this.mediaRecorder = options.mediaRecorder;
     this.eventTarget = new EventTarget();
 
+    this.readableStream = new ReadableStream({
+      start(controller) {
+        if (!this.mediaRecorder) return;
+        this.mediaRecorder.addEventListener("dataavailable", ({ data }: { data: Blob }) => {
+          controller.enqueue(data);
+        });
+      },
+      pull(controller) {
+        if (!this.mediaRecorder) return;
+        this.mediaRecorder.requestData();
+      },
+      cancel(reason) {
+        if (!this.mediaRecorder) return;
+        this.mediaRecorder.stop()
+      }
+    });
+
+    this.transformStream = new TransformStream(
+      new UpChunkTransformStream({
+        chunkByteSize: this.chunkByteSize,
+      })
+    );
+
+    this.writableStream = new WritableStream(
+      new UpChunkWritableStream({
+        headers: this.headers,
+        endpoint: this.endpointValue,
+        dispatch: this.dispatch
+      })
+    );
+
+
     this.validateOptions();
-    this.getEndpoint().then(() => this.sendChunks());
+    this.getEndpoint().then(async () => {
+      if (this.file) {
+        // @ts-ignore
+        const results = await this.file.stream().pipeThrough(this.transformStream).pipeTo(this.writableStream);
+      } else if (this.mediaRecorder) {
+        const results = await this.readableStream.pipeThrough(this.transformStream).pipeTo(this.writableStream);
+      }
+    });
 
     // restart sync when back online
     // trigger events when offline/back online
-    if (typeof(window) !== 'undefined') {
+    if (typeof (window) !== 'undefined') {
       window.addEventListener('online', () => {
         if (!this.offline) {
           return;
@@ -147,8 +329,8 @@ export class UpChunk  {
    * Dispatch an event
    */
   private dispatch(eventName: EventName, detail?: any) {
+    debugger;
     const event: UpchunkEvent = new CustomEvent(eventName, { detail }) as UpchunkEvent;
-
     this.eventTarget.dispatchEvent(event);
   }
 
@@ -206,11 +388,6 @@ export class UpChunk  {
         `minChunkSize must be a positive number in multiples of 256, and smaller than ${this.chunkSize} and ${this.maxChunkSize}`
       );
     }
-    if (this.maxFileBytes > 0 && this.maxFileBytes < this.file.size) {
-      throw new Error(
-        `file size exceeds maximum (${this.file.size} > ${this.maxFileBytes})`
-      );
-    }
     if (
       this.attempts &&
       (typeof this.attempts !== 'number' || this.attempts <= 0)
@@ -223,6 +400,23 @@ export class UpChunk  {
         this.delayBeforeAttempt < 0)
     ) {
       throw new TypeError('delayBeforeAttempt must be a positive number');
+    }
+
+    if ((!this.file && !this.mediaRecorder) || (this.file && this.mediaRecorder)) {
+      throw new Error('must provide one File or one MediaRecorder instance as your upload datasource')
+    }
+
+    if (this.file) {
+      if (!(this.file instanceof File)) {
+        throw new TypeError('file must be a File object');
+      }
+
+      // todo: streaming uploads should cut off when maxFileBytes has been exceeded?
+      if (this.maxFileBytes > 0 && this.maxFileBytes < this.file.size) {
+        throw new Error(
+          `file size exceeds maximum (${this.file.size} > ${this.maxFileBytes})`
+        );
+      }
     }
   }
 
@@ -245,7 +439,7 @@ export class UpChunk  {
    * Get portion of the file of x bytes corresponding to chunkSize
    */
   private getChunk() {
-    return new Promise<void> ((resolve) => {
+    return new Promise<void>((resolve) => {
       // Since we start with 0-chunkSize for the range, we need to subtract 1.
       const length =
         this.totalChunks === 1 ? this.file.size : this.chunkByteSize;
@@ -268,11 +462,11 @@ export class UpChunk  {
       xhrObject.upload.onprogress = (event: ProgressEvent) => {
         const remainingChunks = this.totalChunks - this.chunkCount;
         // const remainingBytes = this.file.size-(this.nextChunkRangeStart+event.loaded);
-        const percentagePerChunk = (this.file.size-this.nextChunkRangeStart)/this.file.size/remainingChunks;
-        const successfulPercentage = this.nextChunkRangeStart/this.file.size;
+        const percentagePerChunk = (this.file.size - this.nextChunkRangeStart) / this.file.size / remainingChunks;
+        const successfulPercentage = this.nextChunkRangeStart / this.file.size;
         const currentChunkProgress = event.loaded / (event.total ?? this.chunkByteSize);
         const chunkPercentage = currentChunkProgress * percentagePerChunk;
-        this.dispatch('progress', Math.min((successfulPercentage + chunkPercentage)*100, 100));
+        this.dispatch('progress', Math.min((successfulPercentage + chunkPercentage) * 100, 100));
       };
     };
 
@@ -321,9 +515,8 @@ export class UpChunk  {
     if (this.attemptCount < this.attempts) {
       setTimeout(() => this.sendChunks(), this.delayBeforeAttempt * 1000);
       this.dispatch('attemptFailure', {
-        message: `An error occured uploading chunk ${this.chunkCount}. ${
-          this.attempts - this.attemptCount
-        } retries left.`,
+        message: `An error occured uploading chunk ${this.chunkCount}. ${this.attempts - this.attemptCount
+          } retries left.`,
         chunkNumber: this.chunkCount,
         attemptsLeft: this.attempts - this.attemptCount,
       });
@@ -372,11 +565,10 @@ export class UpChunk  {
           if (this.chunkCount < this.totalChunks) {
             // dynamic chunk sizing
             if (this.dynamicChunkSize) {
-              if (lastChunkInterval < 10)
-              {
-                this.chunkSize = Math.min(this.chunkSize * 2,this.maxChunkSize);
+              if (lastChunkInterval < 10) {
+                this.chunkSize = Math.min(this.chunkSize * 2, this.maxChunkSize);
               } else if (lastChunkInterval > 30) {
-                this.chunkSize = Math.max(this.chunkSize / 2,this.minChunkSize);
+                this.chunkSize = Math.max(this.chunkSize / 2, this.minChunkSize);
               }
               // ensure it's a multiple of 256k
               this.chunkSize = Math.ceil(this.chunkSize / 256) * 256;
@@ -386,7 +578,7 @@ export class UpChunk  {
 
               // Re-estimate the total number of chunks, by adding the completed
               // chunks to the remaining chunks
-              const remainingChunks = (this.file.size-this.nextChunkRangeStart)/this.chunkByteSize;
+              const remainingChunks = (this.file.size - this.nextChunkRangeStart) / this.chunkByteSize;
               this.totalChunks = Math.ceil(this.chunkCount + remainingChunks);
             }
             this.sendChunks();
