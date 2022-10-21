@@ -42,8 +42,10 @@ export interface UpChunkOptions {
 type UpChunkTransformStreamConfig = {
   chunkByteSize: number;
 }
+
+let count = -0;
 class UpChunkTransformStream {
-  private storage: Blob[] = []
+  private storage: Blob | null = null
   private chunkByteSize: number;
 
   constructor(config: UpChunkTransformStreamConfig) {
@@ -60,44 +62,67 @@ class UpChunkTransformStream {
       new Blob([chunk], { type: 'application/octet-stream' }) :
       chunk;
 
-    let rangeStart = 0;
-    let rangeEnd = this.chunkByteSize - (this.storage[0]?.size || 0)
+    // let rangeStart = 0;
+    // let rangeEnd = this.chunkByteSize - (this.storage?.size || 0)
     let remainingBytes = incomingChunk.size;
 
-    while (remainingBytes > 0) {
-      // if previous chunk has room for us, join this chunk and the prev chunk together.
-      const partial = incomingChunk.slice(rangeStart, rangeEnd);
+    console.log("remainingBytes", remainingBytes)
+    console.log("storage", this.storage)
 
-      const assembledChunk = new Blob([...this.storage, partial], {
-        type: 'application/octet-stream',
-      });
+    this.storage = this.storage ? new Blob([this.storage, incomingChunk]) : incomingChunk;
 
-      // debugger;
-
-      remainingBytes = remainingBytes - partial.size
-      rangeStart = incomingChunk.size - remainingBytes;
-      const offset = rangeStart + this.chunkByteSize - 1
-      rangeEnd = offset < incomingChunk.size ? offset : incomingChunk.size;
-
-      // debugger;
-
-      if (assembledChunk.size === this.chunkByteSize) {
-        // debugger;
-        controller.enqueue(assembledChunk);
-        this.storage = [];
-        // todo: get next optimal dynamic chunk size?
-      } else {
-        // debugger;
-        this.storage = [assembledChunk]
-      }
+    if (this.storage.size < this.chunkByteSize) {
+      return;
     }
+
+    while (this.storage && this.storage.size >= this.chunkByteSize) {
+      const chunk = this.storage.slice(0, this.chunkByteSize);
+      count += 1;
+      console.log("before enqueue", count)
+      controller.enqueue(chunk);
+      console.log("after enqueue", count)
+      this.storage = this.storage.size === this.chunkByteSize ? null : this.storage.slice(this.chunkByteSize);
+    }
+
+    // while (remainingBytes > 0) {
+    //   // if previous chunk has room for us, join this chunk and the prev chunk together.
+    //   const partial = incomingChunk.slice(rangeStart, rangeEnd);
+
+    //   // const assembledChunk = new Blob([this.storage?, partial], {
+    //   //   type: 'application/octet-stream',
+    //   // });
+
+    //   // debugger;
+
+    //   remainingBytes = remainingBytes - partial.size
+    //   rangeStart = incomingChunk.size - remainingBytes;
+    //   const offset = rangeStart + this.chunkByteSize - 1
+    //   rangeEnd = offset < incomingChunk.size ? offset : incomingChunk.size;
+
+    //   // debugger;
+
+    //   if (assembledChunk.size === this.chunkByteSize) {
+    //     // debugger;
+    //     console.log("before enqueue")
+    //     console.log(assembledChunk.size)
+    //     console.log(this.storage.size - assembledChunk.size)
+    //     controller.enqueue(assembledChunk);
+    //     console.log("after enqueue")
+    //     this.storage = [];
+    //     // todo: get next optimal dynamic chunk size?
+    //   } else {
+    //     // debugger;
+    //     // console.log("before storing a partial chunk")
+    //     this.storage = assembledChunk
+    //   }
+    // }
   }
 
   flush(controller: TransformStreamDefaultController) {
     // Clean up and enqueue any chunks we’re still holding on to
     console.log('flushing....');
-    if (this.storage[0]?.size > 0) {
-      controller.enqueue(this.storage[0]);
+    if (this.storage && this.storage.size > 0) {
+      controller.enqueue(this.storage);
     }
   }
 }
@@ -160,10 +185,10 @@ class UpChunkWritableStream {
     // if (this.paused || this.offline || this.success) {
     //   return;
     // }
-    console.log('writing')
+    console.log('writing', count)
     this.attemptCount += 1;
     this.lastChunkStart = new Date();
-    console.log(chunk);
+    console.log(chunk.size);
     // this.dispatch('success');
     // this.sendChunk(chunk).then((res) => {})
   }
@@ -267,7 +292,8 @@ export class UpChunk {
         headers: this.headers,
         endpoint: this.endpointValue,
         dispatch: this.dispatch
-      })
+      }),
+      { strategy: new CountQueuingStrategy({ highWaterMark: 1 }) }
     );
 
 
