@@ -6,12 +6,14 @@ const readableStreamIterable = (readableStream) => {
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
+            console.log('internal done');
             return;
           }
           yield value;
         }
       } finally {
         reader.releaseLock();
+        return;
       }
     },
   };
@@ -69,6 +71,19 @@ picker.onchange = async () => {
   let chunkSize = 100;
   let remainingChunk = undefined;
   let fileChunkIterable = readableStreamIterable(file.stream());
+  let combinedChunkIterable = combinedIterable(file.stream());
+  conbminedChunkIterable.chunkSize = chunkSize;
+
+  // let fileChunkIterator = fileChunkIterable[Symbol.asyncIterator]();
+  // let uploadDone = false;
+  // let paused = false;
+  // while (!uploadDone && !paused) {
+  //   const { value, done } = await fileChunkIterator.next();
+  //   if (value) console.log('value.length', value.length);
+  //   uploadDone = done;
+  //   // console.log('not done!', 'done', done, upload);
+  // }
+
   // NOTE: These async for loops will need to be slightly refactored and broken into a function to handle pause cases
   for await (const chunk of fileChunkIterable) {
     console.log('chunk.size', chunk.length);
@@ -79,9 +94,7 @@ picker.onchange = async () => {
     const contattedChunk = remainingChunk
       ? new Blob([remainingChunk, incomingChunk])
       : incomingChunk;
-    const choppyChunkIterable = choppedAndScrewedChunkIterable(contattedChunk, {
-      remainingChunk,
-    });
+    const choppyChunkIterable = choppedAndScrewedChunkIterable(contattedChunk);
     remainingChunk = undefined;
     choppyChunkIterable.chunkSize = chunkSize;
     console.log('next chunkByteSize', choppyChunkIterable.chunkByteSize);
@@ -102,9 +115,9 @@ picker.onchange = async () => {
     }
   }
 
-  // Here is where we'd upload the last chunk
-  if (remainingChunk) {
-    console.log('last remainingChunk.size', remainingChunk.size);
-    remainingChunk = undefined;
-  }
+  // // Here is where we'd upload the last chunk
+  // if (remainingChunk) {
+  //   console.log('last remainingChunk.size', remainingChunk.size);
+  //   remainingChunk = undefined;
+  // }
 };
