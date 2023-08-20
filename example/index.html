@@ -16,6 +16,10 @@
 
     <script src="/upchunk.js"></script>
     <script src="https://unpkg.com/hls.js@0.11.0/dist/hls.js"></script>
-    <script src="./script.js"></script>
+    <!-- @TODO don't forget to switch this back to script.js before merging/when testing upchunk directly! (CJP) -->
+    <script src="./test.js"></script>
+    <!-- <script src="./script.js"></script> -->
+    <input id="paused" type="checkbox"/><label for="paused">Paused</label>
+    <video id="video" controls style="width: 500px;"></video>
   </body>
 </html>
